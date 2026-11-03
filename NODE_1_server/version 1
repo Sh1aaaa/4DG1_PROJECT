@@ -6,8 +6,8 @@
 #include <time.h>
 
 // ---------- Settings ----------
-const char* WIFI_SSID = "YOUR_WIFI_NAME";      // TODO: move to the configuration portal (Week 2)
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "301 TECH";      // TODO: move to the configuration portal (Week 2)
+const char* WIFI_PASS = "qwerty301!!!";
 const char* FW_VERSION = "1.0.0";
 
 const long GMT_OFFSET_SEC = 8 * 3600;           // Philippines, UTC+8
@@ -243,9 +243,9 @@ function trackAlerts() {
   nodes.forEach(n => {
     const name = (CONFIG.nodes[n.node_id] || {}).name || n.node_id;
     const issues = [];
-    if (!n.online) issues.push(['offline', name + ' went offline']);
+    if (!n.online && n.last_seen) issues.push(['offline', name + ' went offline']);
     Object.entries(n.readings).forEach(([k, v]) => {
-      if (exceeded(k, v)) issues.push([k, `${name}: ${CONFIG.metrics[k][0].toLowerCase()} is ${fmt(k, v)} ${CONFIG.metrics[k][1]}, above ${CONFIG.metrics[k][2]}`]);
+      if (exceeded(k, v)) issues.push([k, name + ': ' + CONFIG.metrics[k][0].toLowerCase() + ' is ' + fmt(k, v) + ' ' + CONFIG.metrics[k][1] + ', above ' + CONFIG.metrics[k][2]]);
     });
     const keys = issues.map(i => i[0]).join();
     if (keys && lastAlertKey[n.node_id] !== keys) {
@@ -255,7 +255,7 @@ function trackAlerts() {
   });
   alertLog = alertLog.slice(0, 30);
   $('alerts').innerHTML = alertLog.length
-    ? alertLog.map(a => `<li>a.text<time>{a.time}</time></li>`).join('')
+    ? alertLog.map(a => '<li>' + a.text + '<time>' + a.time + '</time></li>').join('')
     : '<li class="muted">No alerts so far.</li>';
 }
 
@@ -347,7 +347,7 @@ async function refreshChart() {
   renderHistory(currentRows);
 }
 
-('chartNode').innerHTML=Object.entries(CONFIG.nodes).map(([id,n])=>`<optionvalue="{id}">${n.name}</option>`).join('');
+$('chartNode').innerHTML = Object.entries(CONFIG.nodes).map(([id, n]) => '<option value="' + id + '">' + n.name + '</option>').join('');
 $('chartNode').onchange = refreshChart;
 $('chartMetric').onchange = refreshChart;
 $('csvBtn').onclick = () => currentRows.length ? downloadCsv(currentRows) : toast('No readings to export yet.');
