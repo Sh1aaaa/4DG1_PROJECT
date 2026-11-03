@@ -1,0 +1,629 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include <Update.h>
+#include <time.h>
+
+// ---------- Settings ----------
+const char* WIFI_SSID = "YOUR_WIFI_NAME";      // TODO: move to the configuration portal (Week 2)
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* FW_VERSION = "1.0.0";
+
+const long GMT_OFFSET_SEC = 8 * 3600;           // Philippines, UTC+8
+const char* NTP_SERVER = "pool.ntp.org";
+
+const int NODE_COUNT = 2;
+const char* NODE_IDS[NODE_COUNT]   = {"NODE_01", "NODE_02"};
+const char* NODE_NAMES[NODE_COUNT] = {"Entrance", "Classroom"};
+const unsigned long NODE_TIMEOUT_MS = 15000;    // node is "offline" after this long without data
+const size_t LOG_MAX_BYTES = 32768;             // rotate a node's log file above this size
+
+// ---------- State ----------
+WebServer server(80);
+
+struct NodeState {
+  bool seen = false;
+  unsigned long lastSeenMs = 0;
+  String lastSeenTime = "";
+  String readingsJson = "{}";   // latest readings as a JSON object
+  String pendingCmd = "";       // command waiting for the node to pick up
+};
+NodeState nodes[NODE_COUNT];
+
+unsigned long lastWifiTry = 0, lastTimePrint = 0;
+
+// ---------- Dashboard page (stored in flash) ----------
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building Monitor</title>
+<style>
+:root{
+  --bg:#e9eef0; --panel:#fff; --ink:#14282e; --muted:#5d7178; --line:#cfd9dc;
+  --accent:#0b6e75; --accent-ink:#fff; --ok:#1f7a4d; --warn:#b4580a; --bad:#a3262a;
+  --warn-bg:#fbeedd; --bad-bg:#f8e1e1;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0f1b1f;--panel:#17262b;--ink:#e3eef0;--muted:#8fa6ad;--line:#2a3d44;
+  --accent:#4fc1c9;--accent-ink:#06262a;--ok:#5fd193;--warn:#f0a35a;--bad:#f27b7e;
+  --warn-bg:#3a2a17;--bad-bg:#3b1d1f}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1{font-size:1.5rem;margin:0;letter-spacing:-.01em}
+h2{font-size:1.05rem;margin:0 0 .75rem}
+.muted{color:var(--muted);margin:.15rem 0 0;font-size:.9rem}
+.top{display:flex;justify-content:space-between;align-items:center;gap:1rem;
+  padding:1.1rem clamp(1rem,4vw,2.5rem);border-bottom:1px solid var(--line);background:var(--panel)}
+.top-right{display:flex;gap:.6rem;align-items:center}
+main{padding:clamp(1rem,3vw,2rem) clamp(1rem,4vw,2.5rem);display:grid;gap:1.25rem;max-width:1400px;margin:0 auto}
+.pill{padding:.25rem .7rem;border-radius:99px;font-size:.82rem;font-weight:600;border:1px solid var(--line)}
+.pill.on{background:var(--ok);color:#fff;border-color:transparent}
+.pill.off{background:var(--bad);color:#fff;border-color:transparent}
+.nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:1rem}
+.node{background:var(--panel);border:1px solid var(--line);border-left:6px solid var(--ok);border-radius:6px;padding:1rem}
+.node.offline{border-left-color:var(--muted);opacity:.85}
+.node.alert{border-left-color:var(--bad)}
+.node-head{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem}
+.node-head h3{margin:0;font-size:1.05rem}
+.state{font-size:.8rem;font-weight:600;color:var(--ok)}
+.offline .state{color:var(--muted)}.alert .state{color:var(--bad)}
+.sub{color:var(--muted);font-size:.8rem;margin-bottom:.7rem}
+.readings{display:grid;grid-template-columns:1fr 1fr;gap:.6rem .8rem;margin:0 0 .9rem}
+.readings div{min-width:0}
+.readings dt{font-size:.78rem;color:var(--muted)}
+.readings dd{margin:0;font-size:1.35rem;font-weight:600;font-variant-numeric:tabular-nums}
+.readings dd small{font-size:.75rem;font-weight:400;color:var(--muted);margin-left:2px}
+.readings dd.bad{color:var(--bad)}
+.cmds{display:flex;gap:.5rem;flex-wrap:wrap}
+.btn{font:inherit;font-size:.85rem;padding:.4rem .8rem;border-radius:5px;border:1px solid var(--accent);
+  background:transparent;color:var(--accent);cursor:pointer}
+.btn:hover{background:var(--accent);color:var(--accent-ink)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:1rem;min-width:0}
+.panel-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.6rem;margin-bottom:.5rem}
+.panel-head h2{margin:0}
+.controls{display:flex;gap:1rem;flex-wrap:wrap}
+label{font-size:.85rem;color:var(--muted)}
+select{font:inherit;margin-left:.3rem;padding:.25rem .4rem;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:4px}
+canvas{width:100%;display:block}
+.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.6fr);gap:1.25rem}
+.alerts{list-style:none;margin:0;padding:0;display:grid;gap:.5rem;max-height:320px;overflow:auto}
+.alerts li{padding:.5rem .7rem;border-radius:5px;background:var(--bad-bg);font-size:.88rem}
+.alerts li.muted{background:none;padding:0}
+.alerts time{display:block;font-size:.75rem;color:var(--muted)}
+.table-wrap{overflow:auto;max-height:320px}
+table{width:100%;border-collapse:collapse;font-size:.85rem;font-variant-numeric:tabular-nums}
+th,td{padding:.4rem .6rem;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:600}
+.toast{position:fixed;left:50%;bottom:1.2rem;transform:translate(-50%,150%);background:var(--ink);color:var(--bg);
+  padding:.6rem 1rem;border-radius:6px;transition:transform .2s;font-size:.9rem}
+.toast.show{transform:translate(-50%,0)}
+@media(max-width:800px){.split{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){.toast{transition:none}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Building Monitor</h1>
+    <p id="meta" class="muted">Connecting to server…</p>
+  </div>
+  <div class="top-right">
+    <span id="serverState" class="pill">Connecting</span>
+  </div>
+</header>
+
+<main>
+  <section aria-label="Nodes">
+    <div id="nodes" class="nodes"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Trends</h2>
+      <div class="controls">
+        <label>Node <select id="chartNode"></select></label>
+        <label>Reading <select id="chartMetric"></select></label>
+      </div>
+    </div>
+    <canvas id="chart" height="240" aria-label="Trend chart"></canvas>
+  </section>
+
+  <div class="split">
+    <section class="panel">
+      <h2>Alerts</h2>
+      <ul id="alerts" class="alerts"><li class="muted">No alerts so far.</li></ul>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>History</h2>
+        <button id="csvBtn" class="btn">Download CSV</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead id="histHead"></thead>
+          <tbody id="histBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+<div id="toast" class="toast" role="status"></div>
+<script>
+// ===== Configuration: edit names, commands and alert limits =====
+const CONFIG = {
+  refreshMs: 5000,
+  historyLimit: 60,
+  nodes: {
+    NODE_01: { name: 'Entrance',  cmds: [['led_on','LED on'],['led_off','LED off']] },
+    NODE_02: { name: 'Classroom', cmds: [['buzzer_on','Buzzer on'],['buzzer_off','Buzzer off']] }
+  },
+  // key: [label, unit, alert-above value or null]
+  metrics: {
+    temperature: ['Temperature','°C',35],
+    humidity:    ['Humidity','%',85],
+    light:       ['Light','%',null],
+    motion:      ['Motion','',null],
+    door:        ['Door','',null],
+    rssi:        ['Signal','dBm',null]
+  }
+};
+
+const $ = id => document.getElementById(id);
+let nodes = [], serverUp = false, alertLog = [], lastAlertKey = {}, currentRows = [];
+
+// ===== Data layer =====
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return r.json();
+}
+
+async function loadNodes() {
+  try { nodes = await api('/api/nodes'); serverUp = true; }
+  catch (e) { serverUp = false; }
+}
+
+async function loadHistory(id) {
+  try { return await api('/api/history?node=' + id + '&limit=' + CONFIG.historyLimit); }
+  catch (e) { return []; }
+}
+
+async function sendCommand(id, command) {
+  try {
+    await api('/api/commands/set', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ node_id: id, command }) });
+    toast(CONFIG.nodes[id].name + ': ' + command.replace('_', ' ') + ' sent');
+  } catch (e) { toast('Could not send command. Check the server connection.'); }
+}
+
+// ===== Rendering =====
+function fmt(k, v) {
+  if (typeof v === 'boolean') return v ? 'Detected' : 'None';
+  return typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(1)) : v;
+}
+function exceeded(k, v) {
+  const t = CONFIG.metrics[k] && CONFIG.metrics[k][2];
+  return t != null && typeof v === 'number' && v > t;
+}
+
+function renderNodes() {
+  const wrap = $('nodes');
+  wrap.innerHTML = '';
+  nodes.forEach(n => {
+    const cfg = CONFIG.nodes[n.node_id] || { name: n.node_name, cmds: [] };
+    const bad = Object.entries(n.readings).filter(([k, v]) => exceeded(k, v));
+    const el = document.createElement('article');
+    el.className = 'node' + (!n.online ? ' offline' : bad.length ? ' alert' : '');
+    const rows = Object.entries(n.readings)
+      .filter(([k]) => CONFIG.metrics[k] && k !== 'rssi')
+      .map(([k, v]) => `<div><dt>CONFIG.metrics[k][0]</dt><ddclass="{exceeded(k, v) ? 'bad' : ''}">fmt(k,v)<small>{typeof v === 'number' ? CONFIG.metrics[k][1] : ''}</small></dd></div>`).join('');
+    el.innerHTML = `<div class="node-head"><h3>${cfg.name}</h3>
+      <span class="state">${!n.online ? 'Offline' : bad.length ? 'Alert' : 'Online'}</span></div>
+      <div class="sub">${n.node_id} · ${n.online ? 'Signal ' + (n.readings.rssi ?? '–') + ' dBm' : 'Last seen ' + (n.last_seen || 'never').replace('T', ' ')}</div>
+      <dl class="readings">${rows || '<div class="muted">No data yet</div>'}</dl><div class="cmds"></div>`;
+    cfg.cmds.forEach(([cmd, label]) => {
+      const b = document.createElement('button');
+      b.className = 'btn'; b.textContent = label; b.disabled = !n.online;
+      b.onclick = () => sendCommand(n.node_id, cmd);
+      el.querySelector('.cmds').appendChild(b);
+    });
+    wrap.appendChild(el);
+  });
+}
+
+function trackAlerts() {
+  nodes.forEach(n => {
+    const name = (CONFIG.nodes[n.node_id] || {}).name || n.node_id;
+    const issues = [];
+    if (!n.online) issues.push(['offline', name + ' went offline']);
+    Object.entries(n.readings).forEach(([k, v]) => {
+      if (exceeded(k, v)) issues.push([k, `${name}: ${CONFIG.metrics[k][0].toLowerCase()} is ${fmt(k, v)} ${CONFIG.metrics[k][1]}, above ${CONFIG.metrics[k][2]}`]);
+    });
+    const keys = issues.map(i => i[0]).join();
+    if (keys && lastAlertKey[n.node_id] !== keys) {
+      issues.forEach(i => alertLog.unshift({ time: new Date().toLocaleTimeString(), text: i[1] }));
+    }
+    lastAlertKey[n.node_id] = keys;
+  });
+  alertLog = alertLog.slice(0, 30);
+  $('alerts').innerHTML = alertLog.length
+    ? alertLog.map(a => `<li>a.text<time>{a.time}</time></li>`).join('')
+    : '<li class="muted">No alerts so far.</li>';
+}
+
+// ===== Chart (plain canvas, no libraries, works offline on the ESP32) =====
+function drawChart(rows, metric) {
+  const c = $('chart'), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = 240;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const line = css.getPropertyValue('--accent'), grid = css.getPropertyValue('--line'),
+        txt = css.getPropertyValue('--muted'), bad = css.getPropertyValue('--bad');
+  g.clearRect(0, 0, w, h);
+  const pts = rows.map(r => Number(r[metric])).filter(v => !isNaN(v));
+  g.font = '12px system-ui'; g.fillStyle = txt;
+  if (pts.length < 2) { g.fillText('Waiting for more readings…', 12, 24); return; }
+  const thr = CONFIG.metrics[metric][2];
+  let lo = Math.min(...pts), hi = Math.max(...pts);
+  if (thr != null) hi = Math.max(hi, thr);
+  const pad = (hi - lo || 1) * .15; lo -= pad; hi += pad;
+  const L = 44, R = 10, T = 10, B = 22;
+  const X = i => L + i * (w - L - R) / (pts.length - 1);
+  const Y = v => T + (hi - v) * (h - T - B) / (hi - lo);
+  g.strokeStyle = grid; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(w - R, y); g.stroke();
+    g.fillText(v.toFixed(1), 4, y + 4);
+  }
+  if (thr != null) {
+    g.strokeStyle = bad; g.setLineDash([5, 4]);
+    g.beginPath(); g.moveTo(L, Y(thr)); g.lineTo(w - R, Y(thr)); g.stroke(); g.setLineDash([]);
+    g.fillStyle = bad; g.fillText('limit ' + thr, w - 70, Y(thr) - 4);
+  }
+  g.strokeStyle = line; g.lineWidth = 2; g.beginPath();
+  pts.forEach((v, i) => i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)));
+  g.stroke();
+  g.fillStyle = txt;
+  const first = (rows[0].timestamp || '').slice(11, 19), last = (rows[rows.length - 1].timestamp || '').slice(11, 19);
+  g.fillText(first, L, h - 6); g.fillText(last, w - R - 50, h - 6);
+}
+
+function renderHistory(rows) {
+  const keys = ['timestamp', ...Object.keys(CONFIG.metrics).filter(k => rows.some(r => k in r))];
+  ('histHead').innerHTML='<tr>'+keys.map(k=>`<th>{k === 'timestamp' ? 'Time' : CONFIG.metrics[k][0]}</th>`).join('') + '</tr>';
+  $('histBody').innerHTML = rows.slice(-25).reverse().map(r =>
+    '<tr>' + keys.map(k => `<td>${k === 'timestamp' ? (r[k] || '').replace('T', ' ') : r[k] === undefined ? '–' : fmt(k, r[k])}</td>`).join('') + '</tr>').join('');
+  return keys;
+}
+
+function downloadCsv(rows) {
+  const keys = [...new Set(rows.flatMap(Object.keys))];
+  const csv = [keys.join(','), ...rows.map(r => keys.map(k => r[k] ?? '').join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = $('chartNode').value + '_history.csv';
+  a.click();
+}
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.id); toast.id = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+// ===== Main loop =====
+async function refresh() {
+  await loadNodes();
+  const up = nodes.filter(n => n.online).length;
+  const s = $('serverState');
+  s.textContent = serverUp ? 'Server online' : 'Server unreachable';
+  s.className = 'pill ' + (serverUp ? 'on' : 'off');
+  $('meta').textContent = serverUp
+    ? `${up} of ${nodes.length} nodes online · refreshes every ${CONFIG.refreshMs / 1000} s · updated ${new Date().toLocaleTimeString()}`
+    : 'Cannot reach the server. Retrying…';
+  renderNodes(); trackAlerts();
+  await refreshChart();
+}
+
+async function refreshChart() {
+  const id = $('chartNode').value, metric = $('chartMetric').value;
+  currentRows = await loadHistory(id);
+  const have = Object.keys(CONFIG.metrics).filter(k => currentRows.some(r => k in r));
+  const sel = $('chartMetric');
+  if (sel.dataset.node !== id) {
+    sel.innerHTML = have.map(k => `<option value="k">{CONFIG.metrics[k][0]}</option>`).join('');
+    sel.dataset.node = id;
+  }
+  drawChart(currentRows, sel.value || have[0]);
+  renderHistory(currentRows);
+}
+
+('chartNode').innerHTML=Object.entries(CONFIG.nodes).map(([id,n])=>`<optionvalue="{id}">${n.name}</option>`).join('');
+$('chartNode').onchange = refreshChart;
+$('chartMetric').onchange = refreshChart;
+$('csvBtn').onclick = () => currentRows.length ? downloadCsv(currentRows) : toast('No readings to export yet.');
+window.addEventListener('resize', () => refreshChart());
+refresh();
+setInterval(refresh, CONFIG.refreshMs);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Helpers ----------
+String nowString() {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return "1970-01-01T00:00:00";
+  char b[20];
+  strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%S", &t);
+  return String(b);
+}
+
+bool ntpSynced() { return time(nullptr) > 1700000000; }
+
+int findNode(const String& id) {
+  for (int i = 0; i < NODE_COUNT; i++) if (id == NODE_IDS[i]) return i;
+  return -1;
+}
+
+bool isOnline(int i) {
+  return nodes[i].seen && (millis() - nodes[i].lastSeenMs) < NODE_TIMEOUT_MS;
+}
+
+void sendJson(int code, const String& body) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(code, "application/json", body);
+}
+
+void sendError(int code, const char* msg) {
+  sendJson(code, String("{\"error\":\"") + msg + "\"}");
+}
+
+String logPath(int i) { return String("/log_") + NODE_IDS[i] + ".jsonl"; }
+
+// Append one reading to the node's log file (one JSON object per line)
+void appendLog(int i, const String& line) {
+  File f = LittleFS.open(logPath(i), FILE_APPEND);
+  if (!f) { Serial.println("Log open failed"); return; }
+  f.println(line);
+  size_t size = f.size();
+  f.close();
+  if (size > LOG_MAX_BYTES) {                   // simple rotation keeps flash from filling up
+    String old = logPath(i) + ".old";
+    LittleFS.remove(old);
+    LittleFS.rename(logPath(i), old);
+  }
+}
+
+// ---------- Dashboard page (embedded) ----------
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleNotFound() {
+  sendError(404, "not found");
+}
+
+// ---------- API: node data ----------
+// POST /api/data  - nodes send readings here
+void handleDataPost() {
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) { sendError(400, "invalid json"); return; }
+  int i = findNode(doc["node_id"] | "");
+  if (i < 0) { sendError(400, "unknown node_id"); return; }
+
+  // Keep every field except identity/time, which the server controls
+  JsonDocument readings;
+  for (JsonPair kv : doc.as<JsonObject>()) {
+    String k = kv.key().c_str();
+    if (k != "node_id" && k != "node_name" && k != "timestamp") readings[k] = kv.value();
+  }
+  String ts = nowString();
+  String rj;
+  serializeJson(readings, rj);
+
+  nodes[i].seen = true;
+  nodes[i].lastSeenMs = millis();
+  nodes[i].lastSeenTime = ts;
+  nodes[i].readingsJson = rj;
+
+  JsonDocument line;                            // log line = timestamp + readings
+  line["timestamp"] = ts;
+  for (JsonPair kv : readings.as<JsonObject>()) line[kv.key()] = kv.value();
+  String ls;
+  serializeJson(line, ls);
+  appendLog(i, ls);
+
+  JsonDocument res;
+  res["ack"] = true;
+  res["server_time"] = ts;
+  res["command"] = nodes[i].pendingCmd;
+  nodes[i].pendingCmd = "";                     // delivered
+  String out;
+  serializeJson(res, out);
+  sendJson(200, out);
+}
+
+// GET /api/nodes - status + latest readings for all nodes (used by the dashboard)
+void handleNodes() {
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < NODE_COUNT; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["node_id"] = NODE_IDS[i];
+    o["node_name"] = NODE_NAMES[i];
+    o["online"] = isOnline(i);
+    o["last_seen"] = nodes[i].lastSeenTime;
+    JsonDocument r;
+    deserializeJson(r, nodes[i].readingsJson);
+    o["readings"] = r.as<JsonObject>();
+  }
+  String out;
+  serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+// GET /api/data?node=NODE_01 - latest readings for one node
+void handleDataGet() {
+  int i = findNode(server.arg("node"));
+  if (i < 0) { handleNodes(); return; }
+  sendJson(200, nodes[i].readingsJson);
+}
+
+// GET /api/history?node=NODE_01&limit=60 - last N logged readings
+void handleHistory() {
+  int i = findNode(server.hasArg("node") ? server.arg("node") : "NODE_01");
+  if (i < 0) { sendError(400, "unknown node"); return; }
+  int limit = constrain(server.hasArg("limit") ? server.arg("limit").toInt() : 60, 1, 200);
+
+  std::vector<String> lines;
+  File f = LittleFS.open(logPath(i), "r");
+  if (f) {
+    while (f.available()) {
+      String l = f.readStringUntil('\n');
+      l.trim();
+      if (l.length() < 2) continue;
+      lines.push_back(l);
+      if ((int)lines.size() > limit) lines.erase(lines.begin());
+    }
+    f.close();
+  }
+  String out = "[";
+  for (size_t k = 0; k < lines.size(); k++) { if (k) out += ","; out += lines[k]; }
+  out += "]";
+  sendJson(200, out);
+}
+
+// ---------- API: commands ----------
+// POST /api/commands/set  {"node_id":"NODE_01","command":"led_on"}  (dashboard buttons)
+void handleCommandSet() {
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) { sendError(400, "invalid json"); return; }
+  int i = findNode(doc["node_id"] | "");
+  String cmd = doc["command"] | "";
+  if (i < 0 || cmd.length() == 0) { sendError(400, "need node_id and command"); return; }
+  nodes[i].pendingCmd = cmd;
+  sendJson(200, "{\"ok\":true}");
+}
+
+// GET /api/commands/node1 or node2 - a node asks for its pending command
+void handleCommandGet(int i) {
+  JsonDocument res;
+  res["command"] = nodes[i].pendingCmd;
+  nodes[i].pendingCmd = "";
+  String out;
+  serializeJson(res, out);
+  sendJson(200, out);
+}
+
+// ---------- API: server info ----------
+void handleStatus() {
+  int online = 0;
+  for (int i = 0; i < NODE_COUNT; i++) if (isOnline(i)) online++;
+  JsonDocument doc;
+  doc["version"] = FW_VERSION;
+  doc["uptime_s"] = millis() / 1000;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  doc["time"] = nowString();
+  doc["ntp_synced"] = ntpSynced();
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["fs_used"] = LittleFS.usedBytes();
+  doc["fs_total"] = LittleFS.totalBytes();
+  doc["nodes_online"] = online;
+  String out;
+  serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+void handleVersion() {
+  sendJson(200, String("{\"version\":\"") + FW_VERSION + "\"}");
+}
+
+// ---------- OTA: POST firmware .bin to /update ----------
+void handleUpdateDone() {
+  bool ok = !Update.hasError();
+  sendJson(ok ? 200 : 500, ok ? "{\"ok\":true,\"rebooting\":true}" : "{\"ok\":false}");
+  delay(300);
+  if (ok) ESP.restart();
+}
+
+void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) Update.begin(UPDATE_SIZE_UNKNOWN);
+  else if (up.status == UPLOAD_FILE_WRITE) Update.write(up.buf, up.currentSize);
+  else if (up.status == UPLOAD_FILE_END) Update.end(true);
+}
+
+// ---------- Setup / loop ----------
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nConnected. Open http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWi-Fi not connected yet, will keep retrying.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.printf("\nServer firmware v%s\n", FW_VERSION);
+
+  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
+  else Serial.printf("LittleFS: %u of %u bytes used\n", (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+
+  connectWifi();
+  configTime(GMT_OFFSET_SEC, 0, NTP_SERVER);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/data", HTTP_POST, handleDataPost);
+  server.on("/api/data", HTTP_GET, handleDataGet);
+  server.on("/api/nodes", HTTP_GET, handleNodes);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/version", HTTP_GET, handleVersion);
+  server.on("/api/commands/set", HTTP_POST, handleCommandSet);
+  server.on("/api/commands/node1", HTTP_GET, []() { handleCommandGet(0); });
+  server.on("/api/commands/node2", HTTP_GET, []() { handleCommandGet(1); });
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+
+  // Non-blocking Wi-Fi recovery
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiTry > 10000) {
+    lastWifiTry = millis();
+    Serial.println("Wi-Fi lost, reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+
+  // Week 1 milestone: NTP time visible on the Serial Monitor
+  if (millis() - lastTimePrint > 10000) {
+    lastTimePrint = millis();
+    Serial.printf("Time: %s  (NTP %s)\n", nowString().c_str(), ntpSynced() ? "synced" : "waiting");
+  }
+}
