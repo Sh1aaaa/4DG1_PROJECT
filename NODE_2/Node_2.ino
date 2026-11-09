@@ -1,3 +1,18 @@
+/*
+  NODE 1 - ENTRANCE
+  Firmware: 2.1.0
+
+  Features:
+  - Wi-Fi connection
+  - ArduinoOTA firmware updates
+  - DHT11 temperature and humidity
+  - HC-SR04 distance and presence detection
+  - Automatic and manual door control
+  - Green and red LED indicators
+  - Central Server data transmission
+  - Command polling
+  - LittleFS offline data queue
+*/
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -7,245 +22,148 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
+#include <ESP32Servo.h>
 #include <time.h>
-#include <math.h>
 
-// ======================================================
-// NODE 2 - CLASSROOM MONITORING SYSTEM
-// ESP32 Arduino Core 3.x / ArduinoJson 7
-// ======================================================
+// ==================== CONFIGURATION ====================
 
-// -------------------- PINS ----------------------------
+#define NODE_ID       "NODE_01"
+#define NODE_NAME     "Entrance"
+#define FIRMWARE      "2.1.0"
+
+const char* WIFI_SSID = "301 TECH";
+const char* WIFI_PASS = "qwerty301!!!";
+
+// CHANGE THIS TO YOUR CENTRAL SERVER IP ADDRESS
+const char* SERVER_URL = "http://192.168.1.100";
+
+const char* OTA_HOSTNAME = "node1-entrance";
+const char* OTA_PASSWORD = "Node1OTA2026";
+
+const char* QUEUE_FILE = "/node1_queue.jsonl";
 
 #define DHT_PIN       4
 #define DHT_TYPE      DHT11
-#define LDR_PIN       34
-#define TRIG_PIN      26
-#define ECHO_PIN      27
-#define BUZZER_PIN    25
 
-// -------------------- DEVICE --------------------------
+#define TRIG_PIN      5
+#define ECHO_PIN      18
 
-const char* NODE_ID = "NODE_02";
-const char* NODE_NAME = "Classroom";
-const char* FIRMWARE_VERSION = "1.0.0";
+#define SERVO_PIN     13
+#define GREEN_LED     26
+#define RED_LED       27
 
-// Previously provided Wi-Fi details.
-// Change these if your network is different.
-
-const char* DEFAULT_SSID = "301 TECH";
-const char* DEFAULT_PASSWORD = "qwerty301!!!";
-
-// Configuration access point
-
-const char* AP_SSID = "Node2-Classroom-Setup";
-const char* AP_PASSWORD = "Node2Setup2026";
-
-// Default OTA password
-
-const char* DEFAULT_OTA_PASSWORD = "Node2OTA2026";
-
-// -------------------- TIMING --------------------------
-
-const unsigned long SENSOR_INTERVAL = 3000;
-const unsigned long REPORT_INTERVAL = 5000;
-const unsigned long COMMAND_INTERVAL = 3000;
-const unsigned long QUEUE_INTERVAL = 1200;
-const unsigned long WIFI_RETRY_INTERVAL = 15000;
-
-const size_t MAX_QUEUE_BYTES = 98304;
-
-// -------------------- OBJECTS -------------------------
+// ==================== OBJECTS ====================
 
 DHT dht(DHT_PIN, DHT_TYPE);
+Servo doorServo;
 
-WebServer portal(80);
+WebServer configServer(80);
 Preferences preferences;
 
-// -------------------- CONFIGURATION ------------------
-
-String wifiSSID;
-String wifiPassword;
-String serverHost;
-String otaPassword;
-
-uint16_t serverPort = 80;
-
-int distanceThreshold = 50;
-int temperatureThreshold = 35;
-
-// -------------------- SENSOR DATA --------------------
+// ==================== VARIABLES ====================
 
 float temperature = NAN;
 float humidity = NAN;
 float distanceCM = -1;
 
-int lightRaw = 0;
-int lightPercent = 0;
+bool presence = false;
+bool doorOpen = false;
+bool automaticMode = true;
 
-bool objectDetected = false;
-bool temperatureAlert = false;
-bool systemAlert = false;
-
-// -------------------- BUZZER --------------------------
-
-enum BuzzerMode {
-  BUZZER_AUTO,
-  BUZZER_FORCE_ON,
-  BUZZER_FORCE_OFF
-};
-
-BuzzerMode buzzerMode = BUZZER_AUTO;
-
-bool buzzerActive = false;
-
-unsigned long beepUntil = 0;
-
-String lastBeepCommand = "";
-
-// -------------------- SYSTEM --------------------------
-
-bool filesystemReady = false;
-bool otaStarted = false;
-bool wasConnected = false;
+int doorOpenAngle = 90;
+int doorClosedAngle = 0;
 
 unsigned long lastSensorRead = 0;
-unsigned long lastReport = 0;
+unsigned long lastDataSend = 0;
 unsigned long lastCommandCheck = 0;
-unsigned long lastQueueCheck = 0;
-unsigned long lastWiFiRetry = 0;
+unsigned long lastReconnect = 0;
+unsigned long doorOpenedAt = 0;
 
-uint32_t queueOffset = 0;
+const unsigned long SENSOR_INTERVAL = 2500;
+const unsigned long DATA_INTERVAL = 3000;
+const unsigned long COMMAND_INTERVAL = 1500;
+const unsigned long DOOR_OPEN_TIME = 4000;
 
-// ======================================================
-// HTML ESCAPING
-// ======================================================
+// ==================== WIFI ====================
 
-String htmlEscape(String value) {
-  value.replace("&", "&amp;");
-  value.replace("<", "&lt;");
-  value.replace(">", "&gt;");
-  value.replace("\"", "&quot;");
-  value.replace("'", "&#39;");
-  return value;
-}
+void connectWiFi() {
+  Serial.println();
+  Serial.println("Connecting to Wi-Fi...");
 
-// ======================================================
-// SAVE / LOAD CONFIGURATION
-// ======================================================
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-void loadConfiguration() {
+  unsigned long start = millis();
 
-  preferences.begin("node2cfg", false);
-
-  wifiSSID = preferences.getString(
-    "ssid",
-    DEFAULT_SSID
-  );
-
-  wifiPassword = preferences.getString(
-    "password",
-    DEFAULT_PASSWORD
-  );
-
-  serverHost = preferences.getString(
-    "server",
-    ""
-  );
-
-  otaPassword = preferences.getString(
-    "otapass",
-    DEFAULT_OTA_PASSWORD
-  );
-
-  serverPort = preferences.getUShort(
-    "port",
-    80
-  );
-
-  distanceThreshold = preferences.getInt(
-    "distance",
-    50
-  );
-
-  temperatureThreshold = preferences.getInt(
-    "temp",
-    35
-  );
-
-  queueOffset = preferences.getUInt(
-    "offset",
-    0
-  );
-
-  distanceThreshold = constrain(
-    distanceThreshold, 5, 400
-  );
-
-  temperatureThreshold = constrain(
-    temperatureThreshold, 20, 50
-  );
-
-  if (serverPort == 0) {
-    serverPort = 80;
-  }
-}
-
-// ======================================================
-// BUZZER CONTROL
-// ======================================================
-
-void setBuzzerOutput(bool enabled) {
-
-  if (enabled == buzzerActive) {
-    return;
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
   }
 
-  buzzerActive = enabled;
-
-  if (enabled) {
-    ledcWriteTone(BUZZER_PIN, 2200);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
   } else {
-    ledcWriteTone(BUZZER_PIN, 0);
+    Serial.println("\nWi-Fi connection failed.");
   }
 }
 
-void updateBuzzer() {
+// ==================== OTA ====================
 
-  unsigned long now = millis();
+void setupOTA() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
 
-  bool shouldSound = false;
+  ArduinoOTA.onStart([]() {
+    Serial.println("Node 1 OTA update started.");
+  });
 
-  // Temporary one-second beep
-  if ((int32_t)(beepUntil - now) > 0) {
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nNode 1 OTA update completed.");
+  });
 
-    shouldSound = true;
+  ArduinoOTA.onProgress([](unsigned int progress,
+                           unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r",
+                  (progress * 100) / total);
+  });
 
-  } else if (buzzerMode == BUZZER_FORCE_ON) {
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error: %u\n", error);
+  });
 
-    shouldSound = true;
+  ArduinoOTA.begin();
 
-  } else if (buzzerMode == BUZZER_FORCE_OFF) {
-
-    shouldSound = false;
-
-  } else {
-
-    // Automatic alarm: beep intermittently
-    if (systemAlert) {
-      shouldSound = (now % 800) < 250;
-    }
-  }
-
-  setBuzzerOutput(shouldSound);
+  Serial.println("Node 1 OTA Ready.");
 }
 
-// ======================================================
-// ULTRASONIC DISTANCE SENSOR
-// ======================================================
+// ==================== TIME ====================
 
-float readUltrasonic() {
+void setupTime() {
+  configTime(8 * 3600, 0, "pool.ntp.org",
+             "time.google.com");
+}
 
+String getTimestamp() {
+  struct tm timeInfo;
+
+  if (!getLocalTime(&timeInfo, 100)) {
+    return "unsynchronized";
+  }
+
+  char buffer[30];
+
+  strftime(buffer, sizeof(buffer),
+           "%Y-%m-%d %H:%M:%S", &timeInfo);
+
+  return String(buffer);
+}
+
+// ==================== DISTANCE SENSOR ====================
+
+float readDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
 
@@ -254,178 +172,114 @@ float readUltrasonic() {
 
   digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long duration = pulseIn(
-    ECHO_PIN,
-    HIGH,
-    25000UL
-  );
+  unsigned long duration =
+    pulseIn(ECHO_PIN, HIGH, 30000);
 
   if (duration == 0) {
     return -1;
   }
 
-  float cm = duration * 0.0343f / 2.0f;
-
-  if (cm < 2 || cm > 400) {
-    return -1;
-  }
-
-  return cm;
+  return duration * 0.0343 / 2.0;
 }
 
-// ======================================================
-// SENSOR READING
-// ======================================================
+// ==================== SENSOR READING ====================
 
 void readSensors() {
+  if (millis() - lastSensorRead < SENSOR_INTERVAL) {
+    return;
+  }
+
+  lastSensorRead = millis();
 
   float newTemperature = dht.readTemperature();
   float newHumidity = dht.readHumidity();
 
-  temperature = newTemperature;
-  humidity = newHumidity;
+  if (!isnan(newTemperature)) {
+    temperature = newTemperature;
+  }
 
-  lightRaw = analogRead(LDR_PIN);
+  if (!isnan(newHumidity)) {
+    humidity = newHumidity;
+  }
 
-  // LDR connected to 3V3 with 10k resistor to GND.
-  // Higher reading = brighter light.
+  distanceCM = readDistance();
 
-  lightPercent = map(
-    lightRaw,
-    0,
-    4095,
-    0,
-    100
+  presence = (
+    distanceCM > 0 &&
+    distanceCM <= 100
   );
 
-  distanceCM = readUltrasonic();
-
-  objectDetected =
-    distanceCM > 0 &&
-    distanceCM <= distanceThreshold;
-
-  temperatureAlert =
-    !isnan(temperature) &&
-    temperature >= temperatureThreshold;
-
-  systemAlert =
-    objectDetected || temperatureAlert;
-
-  Serial.println();
-  Serial.println("================================");
-
-  Serial.println("NODE 2 - CLASSROOM");
+  Serial.println("\n--- NODE 1 SENSOR DATA ---");
 
   Serial.print("Temperature: ");
-  if (isnan(temperature)) {
-    Serial.println("Sensor error");
-  } else {
-    Serial.print(temperature);
-    Serial.println(" C");
-  }
+  Serial.println(temperature);
 
   Serial.print("Humidity: ");
-  if (isnan(humidity)) {
-    Serial.println("Sensor error");
-  } else {
-    Serial.print(humidity);
-    Serial.println(" %");
-  }
-
-  Serial.print("Light: ");
-  Serial.print(lightPercent);
-  Serial.println(" %");
+  Serial.println(humidity);
 
   Serial.print("Distance: ");
-  if (distanceCM < 0) {
-    Serial.println("Out of range");
-  } else {
-    Serial.print(distanceCM);
-    Serial.println(" cm");
-  }
+  Serial.println(distanceCM);
 
-  Serial.print("Object Detected: ");
-  Serial.println(objectDetected ? "YES" : "NO");
-
-  Serial.print("Temperature Alert: ");
-  Serial.println(temperatureAlert ? "YES" : "NO");
-
-  Serial.print("System Alert: ");
-  Serial.println(systemAlert ? "YES" : "NO");
-
-  Serial.print("Wi-Fi: ");
-  Serial.println(
-    WiFi.status() == WL_CONNECTED
-      ? "CONNECTED"
-      : "DISCONNECTED"
-  );
-
-  Serial.println("================================");
+  Serial.print("Presence: ");
+  Serial.println(presence);
 }
 
-// ======================================================
-// DATE AND TIME
-// ======================================================
+// ==================== DOOR CONTROL ====================
 
-String getTimestamp() {
+void openDoor() {
+  doorServo.write(doorOpenAngle);
 
-  time_t now = time(nullptr);
+  doorOpen = true;
+  doorOpenedAt = millis();
 
-  // Do not generate a fake timestamp if time
-  // synchronization has not completed.
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(RED_LED, LOW);
 
-  if (now < 1700000000) {
-    return "";
-  }
-
-  struct tm timeInfo;
-  localtime_r(&now, &timeInfo);
-
-  char timestamp[30];
-
-  strftime(
-    timestamp,
-    sizeof(timestamp),
-    "%Y-%m-%dT%H:%M:%S",
-    &timeInfo
-  );
-
-  return String(timestamp);
+  Serial.println("Door opened.");
 }
 
-// ======================================================
-// CREATE SENSOR JSON
-// ======================================================
+void closeDoor() {
+  doorServo.write(doorClosedAngle);
 
-String createSensorJSON() {
+  doorOpen = false;
 
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, HIGH);
+
+  Serial.println("Door closed.");
+}
+
+void handleAutomaticDoor() {
+  if (!automaticMode) {
+    return;
+  }
+
+  if (presence && !doorOpen) {
+    openDoor();
+  }
+
+  if (doorOpen &&
+      !presence &&
+      millis() - doorOpenedAt >= DOOR_OPEN_TIME) {
+    closeDoor();
+  }
+}
+
+// ==================== JSON DATA ====================
+
+String createPayload() {
   JsonDocument doc;
 
   doc["node_id"] = NODE_ID;
   doc["node_name"] = NODE_NAME;
 
-  String timestamp = getTimestamp();
-
-  if (timestamp.length() > 0) {
-    doc["timestamp"] = timestamp;
-  } else {
-    doc["timestamp"] = nullptr;
-  }
-
   if (!isnan(temperature)) {
     doc["temperature"] = temperature;
-  } else {
-    doc["temperature"] = nullptr;
   }
 
   if (!isnan(humidity)) {
     doc["humidity"] = humidity;
-  } else {
-    doc["humidity"] = nullptr;
   }
-
-  doc["light_raw"] = lightRaw;
-  doc["light_percent"] = lightPercent;
 
   if (distanceCM >= 0) {
     doc["distance_cm"] = distanceCM;
@@ -433,1090 +287,279 @@ String createSensorJSON() {
     doc["distance_cm"] = nullptr;
   }
 
-  doc["presence"] = objectDetected;
+  doc["motion"] = presence;
+  doc["presence"] = presence;
 
-  // Compatibility with example server payload.
-  // This represents proximity, not PIR motion.
-  doc["motion"] = objectDetected;
+  doc["door"] = doorOpen ? "open" : "closed";
 
-  doc["temperature_alert"] = temperatureAlert;
-  doc["alert"] = systemAlert;
-
-  doc["buzzer"] = buzzerActive;
-
-  doc["rssi"] =
-    WiFi.status() == WL_CONNECTED
-      ? WiFi.RSSI()
-      : 0;
-
-  doc["firmware_version"] = FIRMWARE_VERSION;
-
+  doc["rssi"] = WiFi.RSSI();
+  doc["firmware_version"] = FIRMWARE;
+  doc["fw"] = FIRMWARE;
   doc["uptime_ms"] = millis();
+  doc["timestamp"] = getTimestamp();
 
-  String output;
+  String payload;
+  serializeJson(doc, payload);
 
-  serializeJson(doc, output);
-
-  return output;
+  return payload;
 }
 
-// ======================================================
-// PROCESS SERVER COMMANDS
-// ======================================================
+// ==================== OFFLINE STORAGE ====================
 
-void processServerCommand(JsonDocument &doc) {
-
-  String command = doc["command"].as<String>();
-
-  command.trim();
-  command.toLowerCase();
-
-  if (command == "buzzer_on" ||
-      command == "alarm_on") {
-
-    buzzerMode = BUZZER_FORCE_ON;
-
-    Serial.println("SERVER: Buzzer ON");
-  }
-
-  else if (command == "buzzer_off" ||
-           command == "alarm_off" ||
-           command == "silence") {
-
-    buzzerMode = BUZZER_FORCE_OFF;
-
-    beepUntil = 0;
-
-    Serial.println("SERVER: Buzzer OFF");
-  }
-
-  else if (command == "buzzer_auto" ||
-           command == "auto") {
-
-    buzzerMode = BUZZER_AUTO;
-
-    Serial.println("SERVER: Automatic mode");
-  }
-
-  else if (command == "beep") {
-
-    String commandID = doc["command_id"].as<String>();
-
-    if (commandID.length() == 0) {
-      commandID = "beep";
-    }
-
-    if (commandID != lastBeepCommand) {
-
-      lastBeepCommand = commandID;
-
-      beepUntil = millis() + 1000;
-
-      Serial.println("SERVER: Beep");
-    }
-  }
-
-  if (command != "beep") {
-    lastBeepCommand = "";
-  }
-
-  // Optional threshold configuration
-
-  if (doc["distance_threshold_cm"].is<int>()) {
-
-    int newThreshold = constrain(
-      doc["distance_threshold_cm"].as<int>(),
-      5,
-      400
-    );
-
-    if (newThreshold != distanceThreshold) {
-
-      distanceThreshold = newThreshold;
-
-      preferences.putInt(
-        "distance",
-        distanceThreshold
-      );
-    }
-  }
-
-  if (doc["temperature_threshold_c"].is<int>()) {
-
-    int newThreshold = constrain(
-      doc["temperature_threshold_c"].as<int>(),
-      20,
-      50
-    );
-
-    if (newThreshold != temperatureThreshold) {
-
-      temperatureThreshold = newThreshold;
-
-      preferences.putInt(
-        "temp",
-        temperatureThreshold
-      );
-    }
-  }
-
-  objectDetected =
-    distanceCM > 0 &&
-    distanceCM <= distanceThreshold;
-
-  temperatureAlert =
-    !isnan(temperature) &&
-    temperature >= temperatureThreshold;
-
-  systemAlert =
-    objectDetected || temperatureAlert;
-}
-
-// ======================================================
-// SERVER URL
-// ======================================================
-
-String serverURL(const String &path) {
-
-  return String("http://") +
-         serverHost +
-         ":" +
-         String(serverPort) +
-         path;
-}
-
-// ======================================================
-// SEND HTTP POST
-// ======================================================
-
-bool sendDataToServer(const String &payload) {
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-
-  if (serverHost.length() == 0) {
-    return false;
-  }
-
-  WiFiClient client;
-  HTTPClient http;
-
-  if (!http.begin(
-        client,
-        serverURL("/api/data")
-      )) {
-    return false;
-  }
-
-  http.setTimeout(2000);
-
-  http.addHeader(
-    "Content-Type",
-    "application/json"
-  );
-
-  int statusCode = http.POST(payload);
-
-  bool accepted =
-    statusCode >= 200 &&
-    statusCode < 300;
-
-  if (accepted) {
-
-    String response = http.getString();
-
-    if (response.length() > 0) {
-
-      JsonDocument doc;
-
-      DeserializationError error =
-        deserializeJson(doc, response);
-
-      if (!error) {
-
-        if (doc["ack"].is<bool>() &&
-            !doc["ack"].as<bool>()) {
-
-          accepted = false;
-
-        } else {
-
-          processServerCommand(doc);
-        }
-      }
-    }
-  }
-
-  http.end();
-
-  if (accepted) {
-
-    Serial.println("POST: Data sent successfully");
-
-  } else {
-
-    Serial.print("POST failed. HTTP code: ");
-    Serial.println(statusCode);
-  }
-
-  return accepted;
-}
-
-// ======================================================
-// GET COMMAND FROM SERVER
-// ======================================================
-
-void checkServerCommands() {
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  if (serverHost.length() == 0) {
-    return;
-  }
-
-  WiFiClient client;
-  HTTPClient http;
-
-  if (!http.begin(
-        client,
-        serverURL("/api/commands/node2")
-      )) {
-    return;
-  }
-
-  http.setTimeout(2000);
-
-  int statusCode = http.GET();
-
-  if (statusCode == 200) {
-
-    String response = http.getString();
-
-    JsonDocument doc;
-
-    DeserializationError error =
-      deserializeJson(doc, response);
-
-    if (!error) {
-      processServerCommand(doc);
-    }
-  }
-
-  http.end();
-}
-
-// ======================================================
-// LITTLEFS OFFLINE BUFFER
-// ======================================================
-
-bool hasBufferedData() {
-
-  if (!filesystemReady) {
-    return false;
-  }
-
-  if (!LittleFS.exists("/queue.jsonl")) {
-    return false;
-  }
-
-  File file = LittleFS.open(
-    "/queue.jsonl",
-    "r"
-  );
+void saveOfflineData(String payload) {
+  File file = LittleFS.open(QUEUE_FILE, FILE_APPEND);
 
   if (!file) {
-    return false;
-  }
-
-  bool result = file.size() > queueOffset;
-
-  file.close();
-
-  return result;
-}
-
-void saveOfflineData(const String &payload) {
-
-  if (!filesystemReady) {
-
-    Serial.println(
-      "BUFFER ERROR: LittleFS unavailable"
-    );
-
-    return;
-  }
-
-  File file = LittleFS.open(
-    "/queue.jsonl",
-    "a"
-  );
-
-  if (!file) {
-
-    Serial.println("BUFFER ERROR: Cannot open file");
-
-    return;
-  }
-
-  if (file.size() + payload.length() + 1 >
-      MAX_QUEUE_BYTES) {
-
-    Serial.println(
-      "BUFFER FULL: New reading not stored"
-    );
-
-    file.close();
+    Serial.println("Unable to save offline data.");
     return;
   }
 
   file.println(payload);
-
   file.close();
 
-  Serial.println("Reading saved to offline buffer");
+  Serial.println("Data saved to offline queue.");
 }
 
-// ======================================================
-// RETRY ONE BUFFERED READING
-// ======================================================
+bool sendPayload(String payload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
 
-void retryBufferedData() {
+  HTTPClient http;
 
-  if (!hasBufferedData()) {
+  http.begin(String(SERVER_URL) + "/api/data");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000);
+
+  int responseCode = http.POST(payload);
+
+  http.end();
+
+  if (responseCode >= 200 && responseCode < 300) {
+    Serial.println("Data sent to Central Server.");
+    return true;
+  }
+
+  Serial.printf("Server response: %d\n", responseCode);
+  return false;
+}
+
+void flushOfflineData() {
+  if (!LittleFS.exists(QUEUE_FILE) ||
+      WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED ||
-      serverHost.length() == 0) {
-    return;
-  }
-
-  File file = LittleFS.open(
-    "/queue.jsonl",
-    "r"
-  );
+  File file = LittleFS.open(QUEUE_FILE, FILE_READ);
 
   if (!file) {
     return;
   }
 
-  if (!file.seek(queueOffset)) {
+  String remaining = "";
+  bool failed = false;
 
-    file.close();
-    return;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (!failed && sendPayload(line)) {
+      continue;
+    }
+
+    failed = true;
+    remaining += line + "\n";
   }
-
-  String payload = file.readStringUntil('\n');
-
-  uint32_t nextOffset = file.position();
-  uint32_t fileSize = file.size();
 
   file.close();
 
-  payload.trim();
+  File newFile = LittleFS.open(QUEUE_FILE, FILE_WRITE);
 
-  if (payload.length() == 0) {
+  if (newFile) {
+    newFile.print(remaining);
+    newFile.close();
+  }
+}
 
-    queueOffset = nextOffset;
+// ==================== DATA TRANSMISSION ====================
 
-    preferences.putUInt(
-      "offset",
-      queueOffset
-    );
-
+void transmitData() {
+  if (millis() - lastDataSend < DATA_INTERVAL) {
     return;
   }
 
-  if (sendDataToServer(payload)) {
+  lastDataSend = millis();
 
-    Serial.println("Buffered data synchronized");
+  String payload = createPayload();
 
-    if (nextOffset >= fileSize) {
-
-      LittleFS.remove("/queue.jsonl");
-
-      queueOffset = 0;
-
-    } else {
-
-      queueOffset = nextOffset;
-    }
-
-    preferences.putUInt(
-      "offset",
-      queueOffset
-    );
-  }
-}
-
-// ======================================================
-// CONFIGURATION WEB PAGE
-// ======================================================
-
-void handleConfigurationPage() {
-
-  String page = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-<title>Node 2 Configuration</title>
-<style>
-body{
-  font-family:Arial,sans-serif;
-  background:#0f172a;
-  color:white;
-  margin:0;
-  padding:20px;
-}
-.container{
-  max-width:520px;
-  margin:20px auto;
-  background:#1e293b;
-  padding:25px;
-  border-radius:14px;
-}
-h1{font-size:25px}
-p{color:#cbd5e1}
-label{
-  display:block;
-  margin-top:15px;
-  margin-bottom:5px;
-}
-input{
-  width:100%;
-  box-sizing:border-box;
-  padding:12px;
-  border:1px solid #475569;
-  border-radius:7px;
-  background:#0f172a;
-  color:white;
-}
-button,.button{
-  display:inline-block;
-  padding:12px 18px;
-  margin-top:20px;
-  background:#2563eb;
-  border:0;
-  border-radius:7px;
-  color:white;
-  text-decoration:none;
-  cursor:pointer;
-}
-.info{
-  background:#334155;
-  padding:12px;
-  border-radius:8px;
-  margin-bottom:15px;
-}
-small{color:#94a3b8}
-</style>
-</head>
-<body>
-<div class="container">
-
-<h1>Node 2 - Classroom</h1>
-
-<div class="info">
-  <p>Firmware: {{VERSION}}</p>
-  <p>Wi-Fi: {{WIFI_STATUS}}</p>
-  <p>Node IP: {{IP}}</p>
-  <p>Server: {{SERVER_STATUS}}</p>
-</div>
-
-<form action="/save" method="POST">
-
-<label>Wi-Fi SSID</label>
-<input name="ssid"
-value="{{SSID}}" required>
-
-<label>Wi-Fi Password</label>
-<input name="password"
-type="password"
-placeholder="Leave blank to keep existing">
-
-<label>Central Server IP Address</label>
-<input name="server"
-value="{{SERVER}}"
-placeholder="Example: 192.168.1.100">
-
-<small>Enter the server address, not the
-Node 2 address. Do not include http://</small>
-
-<label>Server Port</label>
-<input name="port"
-type="number"
-min="1"
-max="65535"
-value="{{PORT}}">
-
-<label>Detection Distance (cm)</label>
-<input name="distance"
-type="number"
-min="5"
-max="400"
-value="{{DISTANCE}}">
-
-<label>Temperature Alert (C)</label>
-<input name="temp"
-type="number"
-min="20"
-max="50"
-value="{{TEMP}}">
-
-<label>OTA Password</label>
-<input name="ota"
-type="password"
-placeholder="Leave blank to keep existing">
-
-<button type="submit">Save and Restart</button>
-
-</form>
-
-<a class="button" href="/status">
-View Sensor JSON
-</a>
-
-<a class="button" href="/beep">
-Test Buzzer
-</a>
-
-</div>
-</body>
-</html>
-)HTML";
-
-  page.replace(
-    "{{VERSION}}",
-    FIRMWARE_VERSION
-  );
-
-  page.replace(
-    "{{WIFI_STATUS}}",
-    WiFi.status() == WL_CONNECTED
-      ? "Connected"
-      : "Disconnected"
-  );
-
-  page.replace(
-    "{{IP}}",
-    WiFi.status() == WL_CONNECTED
-      ? WiFi.localIP().toString()
-      : "Not connected"
-  );
-
-  page.replace(
-    "{{SERVER_STATUS}}",
-    serverHost.length() > 0
-      ? htmlEscape(serverHost)
-      : "Not configured"
-  );
-
-  page.replace(
-    "{{SSID}}",
-    htmlEscape(wifiSSID)
-  );
-
-  page.replace(
-    "{{SERVER}}",
-    htmlEscape(serverHost)
-  );
-
-  page.replace(
-    "{{PORT}}",
-    String(serverPort)
-  );
-
-  page.replace(
-    "{{DISTANCE}}",
-    String(distanceThreshold)
-  );
-
-  page.replace(
-    "{{TEMP}}",
-    String(temperatureThreshold)
-  );
-
-  portal.send(
-    200,
-    "text/html",
-    page
-  );
-}
-
-// ======================================================
-// SAVE WEB CONFIGURATION
-// ======================================================
-
-void handleSaveConfiguration() {
-
-  String newSSID = portal.arg("ssid");
-  String newPassword = portal.arg("password");
-  String newServer = portal.arg("server");
-  String newOTA = portal.arg("ota");
-
-  newSSID.trim();
-  newServer.trim();
-
-  if (newSSID.length() == 0) {
-
-    portal.send(
-      400,
-      "text/plain",
-      "Wi-Fi SSID is required"
-    );
-
-    return;
-  }
-
-  preferences.putString(
-    "ssid",
-    newSSID
-  );
-
-  if (newPassword.length() > 0) {
-
-    preferences.putString(
-      "password",
-      newPassword
-    );
-  }
-
-  preferences.putString(
-    "server",
-    newServer
-  );
-
-  int newPort = portal.arg("port").toInt();
-
-  if (newPort < 1 || newPort > 65535) {
-    newPort = 80;
-  }
-
-  preferences.putUShort(
-    "port",
-    (uint16_t)newPort
-  );
-
-  int newDistance = constrain(
-    portal.arg("distance").toInt(),
-    5,
-    400
-  );
-
-  int newTemperature = constrain(
-    portal.arg("temp").toInt(),
-    20,
-    50
-  );
-
-  preferences.putInt(
-    "distance",
-    newDistance
-  );
-
-  preferences.putInt(
-    "temp",
-    newTemperature
-  );
-
-  if (newOTA.length() >= 8) {
-
-    preferences.putString(
-      "otapass",
-      newOTA
-    );
-  }
-
-  portal.send(
-    200,
-    "text/html",
-    "<h2>Settings saved!</h2>"
-    "<p>ESP32 restarting...</p>"
-  );
-
-  delay(1000);
-
-  ESP.restart();
-}
-
-// ======================================================
-// START CONFIGURATION PORTAL
-// ======================================================
-
-void startConfigurationPortal() {
-
-  WiFi.mode(WIFI_AP_STA);
-
-  WiFi.softAP(
-    AP_SSID,
-    AP_PASSWORD
-  );
-
-  Serial.println();
-  Serial.println("CONFIGURATION PORTAL");
-
-  Serial.print("AP Name: ");
-  Serial.println(AP_SSID);
-
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
-
-  portal.on(
-    "/",
-    HTTP_GET,
-    handleConfigurationPage
-  );
-
-  portal.on(
-    "/save",
-    HTTP_POST,
-    handleSaveConfiguration
-  );
-
-  portal.on(
-    "/status",
-    HTTP_GET,
-    []() {
-
-      portal.send(
-        200,
-        "application/json",
-        createSensorJSON()
-      );
-    }
-  );
-
-  portal.on(
-    "/beep",
-    HTTP_GET,
-    []() {
-
-      beepUntil = millis() + 1000;
-
-      portal.sendHeader(
-        "Location",
-        "/"
-      );
-
-      portal.send(
-        303,
-        "text/plain",
-        "Beep"
-      );
-    }
-  );
-
-  portal.onNotFound(
-    []() {
-
-      portal.sendHeader(
-        "Location",
-        "/"
-      );
-
-      portal.send(
-        302,
-        "text/plain",
-        "Redirecting"
-      );
-    }
-  );
-
-  portal.begin();
-
-  Serial.println("Configuration web server started");
-}
-
-// ======================================================
-// SETUP OTA
-// ======================================================
-
-void startOTA() {
-
-  if (otaStarted) {
-    return;
-  }
-
-  ArduinoOTA.setHostname(
-    "node2-classroom"
-  );
-
-  ArduinoOTA.setPassword(
-    otaPassword.c_str()
-  );
-
-  ArduinoOTA.onStart(
-    []() {
-
-      setBuzzerOutput(false);
-
-      Serial.println("OTA update started");
-    }
-  );
-
-  ArduinoOTA.onEnd(
-    []() {
-
-      Serial.println("OTA update completed");
-    }
-  );
-
-  ArduinoOTA.onError(
-    [](ota_error_t error) {
-
-      Serial.print("OTA error: ");
-      Serial.println((int)error);
-    }
-  );
-
-  ArduinoOTA.begin();
-
-  otaStarted = true;
-
-  Serial.println("Arduino OTA is ready");
-}
-
-// ======================================================
-// WIFI MANAGEMENT
-// ======================================================
-
-void maintainWiFi() {
-
-  bool connected =
-    WiFi.status() == WL_CONNECTED;
-
-  if (connected && !wasConnected) {
-
-    Serial.println();
-    Serial.println("Wi-Fi connected!");
-
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-
-    configTime(
-      8 * 3600,
-      0,
-      "pool.ntp.org",
-      "time.google.com"
-    );
-
-    startOTA();
-  }
-
-  if (!connected && wasConnected) {
-
-    Serial.println("Wi-Fi disconnected");
-
-    Serial.println(
-      "Sensor readings will be buffered"
-    );
-  }
-
-  wasConnected = connected;
-
-  if (!connected &&
-      millis() - lastWiFiRetry >= WIFI_RETRY_INTERVAL) {
-
-    lastWiFiRetry = millis();
-
-    if (wifiSSID.length() > 0) {
-
-      Serial.println("Reconnecting to Wi-Fi...");
-
-      WiFi.reconnect();
-    }
-  }
-}
-
-// ======================================================
-// ESP32 SETUP
-// ======================================================
-
-void setup() {
-
-  Serial.begin(115200);
-
-  delay(500);
-
-  Serial.println();
-  Serial.println("=================================");
-  Serial.println("NODE 2 - CLASSROOM MONITORING");
-  Serial.println("=================================");
-
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(LDR_PIN, INPUT);
-
-  digitalWrite(TRIG_PIN, LOW);
-
-  // Passive buzzer PWM, Arduino Core 3.x
-
-  if (!ledcAttach(
-        BUZZER_PIN,
-        2200,
-        8
-      )) {
-
-    Serial.println(
-      "ERROR: Buzzer PWM initialization failed"
-    );
-  }
-
-  ledcWriteTone(BUZZER_PIN, 0);
-
-  // Initialize DHT11
-
-  dht.begin();
-
-  analogReadResolution(12);
-
-  // Load saved configuration
-
-  loadConfiguration();
-
-  // Initialize offline storage
-
-  filesystemReady = LittleFS.begin(true);
-
-  if (filesystemReady) {
-
-    Serial.println("LittleFS initialized");
-
-    if (!LittleFS.exists("/queue.jsonl")) {
-
-      queueOffset = 0;
-
-      preferences.putUInt(
-        "offset",
-        0
-      );
-    }
-
+  if (!sendPayload(payload)) {
+    saveOfflineData(payload);
   } else {
-
-    Serial.println("LittleFS initialization failed");
+    flushOfflineData();
   }
-
-  // Start configuration access point
-
-  startConfigurationPortal();
-
-  // Connect to existing Wi-Fi
-
-  WiFi.setAutoReconnect(true);
-
-  WiFi.setHostname(
-    "node2-classroom"
-  );
-
-  if (wifiSSID.length() > 0) {
-
-    Serial.print("Connecting to: ");
-    Serial.println(wifiSSID);
-
-    WiFi.begin(
-      wifiSSID.c_str(),
-      wifiPassword.c_str()
-    );
-  }
-
-  lastWiFiRetry = millis();
-
-  Serial.println();
-  Serial.println("NODE 2 INITIALIZED");
-
-  Serial.println(
-    "Setup AP: Node2-Classroom-Setup"
-  );
-
-  Serial.println(
-    "Setup URL: http://192.168.4.1"
-  );
-
-  Serial.println("Firmware: 1.0.0");
 }
 
-// ======================================================
-// MAIN LOOP
-// ======================================================
+// ==================== SERVER COMMANDS ====================
 
-void loop() {
+void executeCommand(String command) {
+  command.trim();
+  command.toLowerCase();
 
-  unsigned long now = millis();
+  Serial.print("Received command: ");
+  Serial.println(command);
 
-  // Process configuration portal requests
-
-  portal.handleClient();
-
-  // Maintain network connection
-
-  maintainWiFi();
-
-  // Handle OTA updates
-
-  if (otaStarted &&
-      WiFi.status() == WL_CONNECTED) {
-
-    ArduinoOTA.handle();
+  if (command == "door_open") {
+    automaticMode = false;
+    openDoor();
   }
 
-  // Read sensors periodically
-
-  if (now - lastSensorRead >= SENSOR_INTERVAL) {
-
-    lastSensorRead = now;
-
-    readSensors();
+  else if (command == "door_close") {
+    automaticMode = false;
+    closeDoor();
   }
 
-  // Update buzzer without blocking
+  else if (command == "auto_on") {
+    automaticMode = true;
+  }
 
-  updateBuzzer();
+  else if (command == "auto_off") {
+    automaticMode = false;
+  }
 
-  // Send sensor readings to server
+  else if (command == "reboot") {
+    ESP.restart();
+  }
+}
 
-  if (now - lastReport >= REPORT_INTERVAL) {
+void processCommandResponse(String response) {
+  JsonDocument doc;
 
-    lastReport = now;
+  DeserializationError error =
+    deserializeJson(doc, response);
 
-    String payload = createSensorJSON();
+  if (error) {
+    Serial.println("Invalid command response.");
+    return;
+  }
 
-    if (hasBufferedData()) {
+  if (doc["commands"].is<JsonArray>()) {
+    JsonArray commands = doc["commands"].as<JsonArray>();
 
-      // Keep queued readings in order
-      saveOfflineData(payload);
+    for (JsonVariant item : commands) {
+      if (item.is<JsonObject>()) {
+        String command = item["command"] |
+                         item["action"] | "";
 
-    } else {
-
-      if (!sendDataToServer(payload)) {
-
-        saveOfflineData(payload);
+        if (command.length() > 0) {
+          executeCommand(command);
+        }
+      } else if (item.is<const char*>()) {
+        executeCommand(item.as<String>());
       }
     }
   }
 
-  // Receive server commands
+  else if (doc["command"].is<const char*>()) {
+    executeCommand(doc["command"].as<String>());
+  }
+}
 
-  if (now - lastCommandCheck >= COMMAND_INTERVAL) {
-
-    lastCommandCheck = now;
-
-    checkServerCommands();
+void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
   }
 
-  // Retry buffered readings
-
-  if (now - lastQueueCheck >= QUEUE_INTERVAL) {
-
-    lastQueueCheck = now;
-
-    retryBufferedData();
+  if (millis() - lastCommandCheck < COMMAND_INTERVAL) {
+    return;
   }
 
-  delay(2);
+  lastCommandCheck = millis();
+
+  HTTPClient http;
+
+  http.begin(String(SERVER_URL) + "/api/commands/node1");
+  http.setTimeout(2000);
+
+  int responseCode = http.GET();
+
+  if (responseCode == 200) {
+    processCommandResponse(http.getString());
+  }
+
+  http.end();
+}
+
+// ==================== WIFI RECONNECTION ====================
+
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  if (millis() - lastReconnect >= 10000) {
+    lastReconnect = millis();
+
+    Serial.println("Reconnecting to Wi-Fi...");
+
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+}
+
+// ==================== SETUP ====================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, HIGH);
+
+  dht.begin();
+
+  doorServo.setPeriodHertz(50);
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  closeDoor();
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS initialization failed.");
+  }
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    setupTime();
+    setupOTA();
+  }
+
+  Serial.println("NODE 1 - ENTRANCE READY");
+}
+
+// ==================== MAIN LOOP ====================
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
+  }
+
+  maintainWiFi();
+
+  readSensors();
+
+  handleAutomaticDoor();
+
+  transmitData();
+
+  pollCommands();
+
+  delay(10);
 }
